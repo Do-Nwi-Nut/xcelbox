@@ -2,7 +2,7 @@
 """PyQt6 시트 계산기 (Excel 함수 지원) - pip install PyQt6"""
 import sys, re, math, json, csv, statistics, datetime, random, time
 from pathlib import Path
-from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, QSettings, QEvent, QTimer, QPoint
+from PyQt6.QtCore import Qt, QItemSelectionModel, QAbstractTableModel, QModelIndex, QSettings, QEvent, QTimer, QPoint
 from PyQt6.QtGui import QColor, QAction, QKeySequence, QFont, QBrush, QCursor, QPixmap, QPainter, QIcon
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTableView,
     QLineEdit, QLabel, QComboBox, QPushButton, QDialog, QFormLayout, QFontComboBox, QSpinBox,
@@ -168,12 +168,35 @@ def col_idx(s):
 
 AUTO = re.compile(r"\s*(?:(?:\$?[A-Za-z]{1,3}\$?\d+|\d+\.?\d*|\.\d+|[-+*/^()])\s*)+")
 
+CALC_TOK = re.compile(
+    r"\s*(?:\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?"   # A1 / A1:B2
+    r"|\d+\.?\d*|\.\d+"                                          # numbers
+    r"|[A-Za-z_][A-Za-z0-9_.]*\("                                  # function(
+    r"|\"[^\"]*\"?"                                               # "text"
+    r"|[-+*/^(),;:<>=&])\s*")
+
+def calc_like(t):
+    """'=' 없이 입력한 수식(예: 5446-sum( , 1+A1*max(B1,)도 수식 입력 중인지 판단"""
+    if not t or t.startswith("'"): return False
+    i, n, has_op = 0, len(t), False
+    while i < n:
+        m = CALC_TOK.match(t, i)
+        if not m or m.end() == i: return False
+        tok = m.group().strip()
+        if tok.endswith("(") and len(tok) > 1:
+            if tok[:-1].upper() not in F: return False
+            has_op = True
+        elif tok in ("+", "-", "*", "/", "^"): has_op = True
+        i = m.end()
+    return has_op
+
 def is_formula(t):
     if not t: return False
     if t.startswith("="): return True
     stripped = t.strip().upper()
     if any(stripped.startswith(k + "(") for k in F.keys()): return True
     if AUTO.fullmatch(t) and re.search(r"[-+*/^A-Za-z]", t): return True
+    if calc_like(t): return True
     return False
 
 def shift_formula(formula, dr, dc):
@@ -415,8 +438,12 @@ class Sheet:
         stripped = t.strip().upper()
         is_func_call = any(stripped.startswith(k + "(") for k in F.keys())
         
-        if is_func_call or t.startswith("=") or (AUTO.fullmatch(t) and re.search(r"[-+*/^A-Za-z]", t)):
-            try: return s.evalf(f_str)
+        if is_func_call or t.startswith("=") or (AUTO.fullmatch(t) and re.search(r"[-+*/^A-Za-z]", t)) or calc_like(t):
+            try:
+                body = re.split(r'("[^"]*")', f_str)
+                opn = sum(x.count("(") - x.count(")") for k, x in enumerate(body) if k % 2 == 0)
+                if opn > 0: f_str += ")" * opn          # 엑셀처럼 닫는 괄호 자동 완성
+                return s.evalf(f_str)
             except Exception:
                 if is_func_call or t.startswith("="):
                     raise
@@ -559,16 +586,15 @@ class Table(QTableView):
     def _ref_ctx(s, w):
         try: t, p = w.text(), w.cursorPosition()
         except RuntimeError: return None
-        if not is_formula(t) and not t.startswith("="):
-            if t == "":
-                return p, 0
-            return None
+        # 방금 클릭/드래그로 넣은 참조가 있으면 그 자리를 다른 셀로 교체
         L = s._last
         if L and L[0] is w and L[3] == t and p == L[1] + L[2]: return L[1], L[2]
-        h = t[:p].rstrip()
-        if h and h[-1] in OPS and h.count('"') % 2 == 0: return p, 0
-        if not h:
-            return p, 0
+        if t == "": return p, 0
+        h = t[:p]
+        if not (t.startswith("=") or is_formula(t) or calc_like(h)): return None
+        h = h.rstrip()
+        if not h: return (p, 0) if t.startswith("=") else None
+        if h[-1] in OPS and h.count('"') % 2 == 0: return p, 0
         return None
 
     def _set_ref(s, w, a, b, st, n):
@@ -977,6 +1003,20 @@ class Main(QMainWindow):
         g = s.st.value("geo")
         if g: s.restoreGeometry(g)
 
+        # 시작 시 수식 입력칸이 아니라 표(셀 선택 상태)에 포커스, 마지막에 선택했던 셀을 현재 셀로
+        try: lr, lc = (int(x) for x in str(s.st.value("last_cell", "0,0")).split(","))
+        except (ValueError, TypeError): lr, lc = 0, 0
+        lr = min(max(lr, 0), s.model.ROWS - 1); lc = min(max(lc, 0), s.model.COLS - 1)
+        s._start_cell = (lr, lc)
+        QTimer.singleShot(0, s._focus_table_on_start)
+
+    def _focus_table_on_start(s):
+        idx = s.model.index(*s._start_cell)
+        s.formula.clearFocus()
+        s.table.setFocus(Qt.FocusReason.OtherFocusReason)
+        s.table.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        s.table.scrollTo(idx)
+
     def create_color_menu(s, is_bg):
         menu = QMenu(s)
         action_pick = menu.addAction(tr("custom"))
@@ -1278,6 +1318,8 @@ class Main(QMainWindow):
         s.auto_save_memo()
         s.st.setValue("geo", s.saveGeometry())
         s.st.setValue("splitter_sizes", s.splitter.sizes())
+        cur = s.table.currentIndex()
+        if cur.isValid(): s.st.setValue("last_cell", f"{cur.row()},{cur.column()}")
         s.save()
         super().closeEvent(e)
 
